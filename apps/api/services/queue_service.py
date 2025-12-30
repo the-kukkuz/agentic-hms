@@ -2,7 +2,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func,asc
 from datetime import datetime, timedelta
 
-from agents.queue.schemas import QueueIntakeRequest, QueueIntakeResponse,CallNextResponse,CallNextRequest,EndConsultationResponse,EndConsultationRequest
+from agents.queue.schemas import QueueIntakeRequest, QueueIntakeResponse,CallNextResponse,CallNextRequest,EndConsultationResponse,EndConsultationRequest,CheckInResponse,CheckInRequest,SkipResponse,SkipRequest,StartConsultationRequest,StartConsultationResponse,QueueStatusRequest,DoctorQueueStatus,ReceptionQueueStatus,PatientQueueStatus,TokenInfo
 from models.doctor_queue import DoctorQueue
 from models.queue_entry import QueueEntry
 from models.visit import Visit
@@ -78,8 +78,14 @@ class QueueService:
                     reason="Doctor shift will end before consultation",
                 )
 
-            # 5️⃣ Assign token
-            token_number = active_count + 1
+            # 5️⃣ Assign token (unique across ALL entries)
+            result = await db.execute(
+                select(func.max(QueueEntry.token_number)).where(
+                    QueueEntry.queue_id == queue.id,
+                )
+            )
+            max_token = result.scalar() or 0
+            token_number = max_token + 1
 
             entry = QueueEntry(
                 queue_id=queue.id,
@@ -89,10 +95,6 @@ class QueueService:
                 status="waiting",
             )
             db.add(entry)
-
-            # 6️⃣ Update visit
-            visit = await db.get(Visit, request.visit_id)
-            visit.token_number = token_number
 
             queue.last_event_type = "VISIT_ADDED"
             queue.last_event_reason = "Within shift capacity"
@@ -140,7 +142,7 @@ class QueueService:
                 select(QueueEntry)
                 .where(
                     QueueEntry.queue_id == queue.id,
-                    QueueEntry.status.in_(["present", "waiting"]),
+                    QueueEntry.status.in_(["present", "waiting", "called"]),
                 )
                 .order_by(
                     asc(
@@ -156,8 +158,8 @@ class QueueService:
             if not entry:
                 raise ValueError("No patients waiting in queue")
 
-            # 3️⃣ Mark entry as in consultation
-            entry.status = "in_consultation"
+            # 3️⃣ Mark entry as called (awaiting patient)
+            entry.status = "called"
             entry.consultation_start_time = datetime.utcnow()
 
             # 4️⃣ Update queue
@@ -199,7 +201,7 @@ class QueueService:
             patient_id=patient.id,
             doctor_id=visit.doctor_id,
             token_number=entry.token_number,
-            status="in_consultation",
+            status="called",
         )
 
     @staticmethod
@@ -262,3 +264,274 @@ class QueueService:
             message="Consultation ended successfully",
         )
     
+    @staticmethod
+    async def check_in(
+        db: AsyncSession,
+        request: CheckInRequest,
+    ) -> CheckInResponse:
+
+        async with db.begin():  # 🔒 TRANSACTION
+
+            # 1️⃣ Find queue entry for this visit & date
+            result = await db.execute(
+                select(QueueEntry)
+                .join(DoctorQueue, QueueEntry.queue_id == DoctorQueue.id)
+                .where(
+                    QueueEntry.visit_id == request.visit_id,
+                    DoctorQueue.queue_date == request.queue_date,
+                )
+            )
+            entry = result.scalar_one_or_none()
+
+            if not entry:
+                raise ValueError("Queue entry not found")
+
+            # 2️⃣ Validate state
+            if entry.status == "present":
+                # Idempotent success
+                return CheckInResponse(
+                    success=True,
+                    visit_id=request.visit_id,
+                    status="present",
+                )
+
+            if entry.status != "waiting":
+                raise ValueError(
+                    f"Cannot check-in patient in state '{entry.status}'"
+                )
+
+            # 3️⃣ Mark as present
+            entry.status = "present"
+            entry.check_in_time = datetime.utcnow()
+
+        # 🔓 COMMIT
+
+        return CheckInResponse(
+            success=True,
+            visit_id=request.visit_id,
+            status="present",
+        )
+    
+
+    @staticmethod
+    async def skip_patient(
+        db: AsyncSession,
+        request: SkipRequest,
+    ) -> SkipResponse:
+
+        async with db.begin():  # 🔒 TRANSACTION
+
+            # 1️⃣ Fetch queue
+            result = await db.execute(
+                select(DoctorQueue).where(
+                    DoctorQueue.doctor_id == request.doctor_id,
+                    DoctorQueue.queue_date == request.queue_date,
+                )
+            )
+            queue = result.scalar_one_or_none()
+
+            if not queue:
+                raise ValueError("No active queue found")
+
+            # 2️⃣ Fetch queue entry
+            result = await db.execute(
+                select(QueueEntry).where(
+                    QueueEntry.queue_id == queue.id,
+                    QueueEntry.visit_id == request.visit_id,
+                )
+            )
+            entry = result.scalar_one_or_none()
+
+            if not entry:
+                raise ValueError("Queue entry not found")
+
+            # 3️⃣ Validate state
+            if entry.status in ("completed", "skipped"):
+                raise ValueError(f"Cannot skip entry in state '{entry.status}'")
+
+            if entry.status == "in_consultation":
+                raise ValueError("Cannot skip patient in active consultation. End consultation first.")
+
+            # 4️⃣ Mark skipped (terminal)
+            entry.status = "skipped"
+            entry.skipped_at = datetime.utcnow()
+            entry.skip_reason = request.reason
+
+            # 🔮 Store future reinsertion metadata
+            entry.skip_position_token = entry.token_number
+            entry.eligible_after_token = entry.token_number + 2  # UNUSED NOW
+
+            # 5️⃣ If this was current visit, free doctor
+            if queue.current_visit_id == request.visit_id:
+                queue.current_visit_id = None
+                queue.current_token = None
+
+            queue.last_event_type = "SKIP"
+            queue.last_event_reason = request.reason
+            queue.last_updated_by = "doctor"
+
+        # 🔓 COMMIT
+
+        return SkipResponse(
+            success=True,
+            visit_id=request.visit_id,
+            status="skipped",
+        )
+    
+    @staticmethod
+    async def start_consultation(
+        db: AsyncSession,
+        request: StartConsultationRequest,
+    ) -> StartConsultationResponse:
+
+        async with db.begin():
+
+            result = await db.execute(
+                select(DoctorQueue).where(
+                    DoctorQueue.doctor_id == request.doctor_id,
+                    DoctorQueue.queue_date == request.queue_date,
+                )
+            )
+            queue = result.scalar_one_or_none()
+
+            if not queue or queue.current_visit_id != request.visit_id:
+                raise ValueError("No active called visit for this doctor")
+
+            result = await db.execute(
+                select(QueueEntry).where(
+                    QueueEntry.queue_id == queue.id,
+                    QueueEntry.visit_id == request.visit_id,
+                    QueueEntry.status == "called",
+                )
+            )
+            entry = result.scalar_one_or_none()
+
+            if not entry:
+                raise ValueError("Visit is not in called state")
+
+            entry.status = "in_consultation"
+            entry.consultation_start_time = datetime.utcnow()
+
+            queue.last_event_type = "CONSULTATION_STARTED"
+            queue.last_updated_by = "doctor"
+
+        return StartConsultationResponse(
+            success=True,
+            visit_id=request.visit_id,
+            status="in_consultation",
+        )
+
+    @staticmethod
+    async def get_status(db, request: QueueStatusRequest):
+
+        # 1️⃣ Fetch queue
+        result = await db.execute(
+            select(DoctorQueue).where(
+                DoctorQueue.doctor_id == request.doctor_id,
+                DoctorQueue.queue_date == request.queue_date,
+            )
+        )
+        queue = result.scalar_one_or_none()
+
+        if not queue:
+            raise ValueError("Queue not found")
+
+        # 2️⃣ Fetch all queue entries
+        result = await db.execute(
+            select(QueueEntry).where(
+                QueueEntry.queue_id == queue.id
+            )
+        )
+        entries = result.scalars().all()
+
+        # ---------- DOCTOR VIEW ----------
+        if request.role == "doctor":
+
+            called_entry = next(
+                (e for e in entries if e.status == "called"), None
+            )
+
+            next_waiting = [
+                TokenInfo(token_number=e.token_number, status=e.status)
+                for e in sorted(entries, key=lambda x: x.token_number)
+                if e.status in ("present", "waiting")
+            ][:3]
+
+            counts = {
+                "waiting": sum(1 for e in entries if e.status == "waiting"),
+                "present": sum(1 for e in entries if e.status == "present"),
+                "skipped": sum(1 for e in entries if e.status == "skipped"),
+            }
+
+            return DoctorQueueStatus(
+                role="doctor",
+                queue_open=queue.queue_open,
+                current_token=queue.current_token,
+                current_visit_id=queue.current_visit_id,
+                called=(
+                    TokenInfo(
+                        token_number=called_entry.token_number,
+                        status=called_entry.status,
+                    )
+                    if called_entry else None
+                ),
+                next_waiting=next_waiting,
+                counts=counts,
+            )
+
+        # ---------- PATIENT VIEW ----------
+        if request.role == "patient":
+
+            if not request.visit_id:
+                raise ValueError("visit_id is required for patient view")
+
+            entry = next(
+                (e for e in entries if e.visit_id == request.visit_id), None
+            )
+
+            if not entry:
+                raise ValueError("Visit not found in queue")
+
+            active_entries = [
+                e for e in entries
+                if e.status in ("waiting", "present", "called")
+            ]
+
+            patients_ahead = sum(
+                1 for e in active_entries
+                if e.token_number < entry.token_number
+            )
+
+            estimated_wait = (
+                patients_ahead * queue.avg_consult_time_minutes
+            )
+
+            return PatientQueueStatus(
+                role="patient",
+                visit_id=request.visit_id,
+                token_number=entry.token_number,
+                status=entry.status,
+                current_token=queue.current_token,
+                patients_ahead=patients_ahead,
+                estimated_wait_minutes=estimated_wait,
+            )
+
+        # ---------- RECEPTION VIEW ----------
+        if request.role == "receptionist":
+
+            return ReceptionQueueStatus(
+                role="receptionist",
+                queue_date=request.queue_date,
+                doctor_id=request.doctor_id,
+                total_visits=len(entries),
+                completed=sum(1 for e in entries if e.status == "completed"),
+                in_progress=sum(
+                    1 for e in entries
+                    if e.status in ("called", "in_consultation")
+                ),
+                waiting=sum(1 for e in entries if e.status == "waiting"),
+                skipped=sum(1 for e in entries if e.status == "skipped"),
+            )
+
+        raise ValueError("Invalid role")
+        

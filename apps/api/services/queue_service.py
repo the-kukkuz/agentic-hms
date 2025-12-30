@@ -1,14 +1,19 @@
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func
+from sqlalchemy import select, func,asc
 from datetime import datetime, timedelta
 
-from agents.queue.schemas import QueueIntakeRequest, QueueIntakeResponse
+from agents.queue.schemas import QueueIntakeRequest, QueueIntakeResponse,CallNextResponse,CallNextRequest
 from models.doctor_queue import DoctorQueue
 from models.queue_entry import QueueEntry
 from models.visit import Visit
+from models.patient import Patient
+from models.doctor import Doctor
+from models.department import Department
+from agents.doctor_assistance.agent import DoctorAssistanceAgent
+from agents.doctor_assistance.state import DoctorAssistanceState
 
 
-class QueueIntakeService:
+class QueueService:
 
     @staticmethod
     async def intake(
@@ -100,4 +105,94 @@ class QueueIntakeService:
             token_number=token_number,
             position=token_number,
             estimated_wait_minutes=active_count * queue.avg_consult_time_minutes,
+        )
+    
+    @staticmethod
+    async def call_next(
+        db: AsyncSession,
+        request: CallNextRequest,
+    ) -> CallNextResponse:
+
+        async with db.begin():
+
+            # 1️⃣ Fetch queue
+            result = await db.execute(
+                select(DoctorQueue).where(
+                    DoctorQueue.doctor_id == request.doctor_id,
+                    DoctorQueue.queue_date == request.queue_date,
+                )
+            )
+            queue = result.scalar_one_or_none()
+
+            if not queue:
+                raise ValueError("No active queue for this doctor")
+
+            if queue.current_visit_id:
+                raise ValueError("Consultation already in progress")
+
+            # 2️⃣ Pick next entry (present > waiting)
+            result = await db.execute(
+                select(QueueEntry)
+                .where(
+                    QueueEntry.queue_id == queue.id,
+                    QueueEntry.status.in_(["present", "waiting"]),
+                )
+                .order_by(
+                    asc(
+                        QueueEntry.status != "present"
+                    ),  # present first
+                    asc(QueueEntry.token_number),
+                )
+                .limit(1)
+            )
+
+            entry = result.scalar_one_or_none()
+
+            if not entry:
+                raise ValueError("No patients waiting in queue")
+
+            # 3️⃣ Mark entry as in consultation
+            entry.status = "in_consultation"
+            entry.consultation_start_time = datetime.utcnow()
+
+            # 4️⃣ Update queue
+            queue.current_token = entry.token_number
+            queue.current_visit_id = entry.visit_id
+            queue.last_event_type = "CALL_NEXT"
+            queue.last_event_reason = "Doctor called next patient"
+            queue.last_updated_by = "doctor"
+
+            # 5️⃣ Fetch visit + patient context
+            visit = await db.get(Visit, entry.visit_id)
+            patient = await db.get(Patient, visit.patient_id)
+            doctor = await db.get(Doctor, visit.doctor_id)
+            # Eagerly resolve department name to avoid async lazy-load later
+            if not doctor:
+                raise ValueError("Doctor not found for visit")
+            dept_name = None
+            if doctor.department_id:
+                dept = await db.get(Department, doctor.department_id)
+                if not dept:
+                    raise ValueError("Doctor department not found")
+                dept_name = dept.name
+        # 🔓 COMMIT DONE — SAFE TO HANDOFF
+
+        # 6️⃣ Handoff to Doctor Assistance Agent
+        state = DoctorAssistanceState(
+            visit_id=visit.id,
+            patient_id=patient.id,
+            doctor_id=visit.doctor_id,
+            department=dept_name,
+            token_number=entry.token_number,
+            symptoms_summary=visit.symptoms_summary,
+        )
+
+        DoctorAssistanceAgent(state).handle()
+
+        return CallNextResponse(
+            visit_id=visit.id,
+            patient_id=patient.id,
+            doctor_id=visit.doctor_id,
+            token_number=entry.token_number,
+            status="in_consultation",
         )

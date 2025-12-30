@@ -4,8 +4,8 @@ from datetime import date
 from uuid import UUID
 
 from db.session import get_db_session
-from services.queue_service import QueueIntakeService
-from agents.queue.schemas import QueueIntakeRequest, QueueIntakeResponse
+from services.queue_service import QueueService
+from agents.queue.schemas import QueueIntakeRequest, QueueIntakeResponse,CallNextRequest,CallNextResponse
 
 router = APIRouter(prefix="/agents/queue", tags=["Queue Agent"])
 
@@ -16,7 +16,17 @@ async def queue_intake(
     db: AsyncSession = Depends(get_db_session),
 ):
     try:
-        result = await QueueIntakeService.intake(db, request)
+        result = await QueueService.intake(db, request)
         return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/call-next", response_model=CallNextResponse)
+async def call_next_patient(
+    request: CallNextRequest,
+    db: AsyncSession = Depends(get_db_session),
+):
+    try:
+        return await QueueService.call_next(db, request)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
